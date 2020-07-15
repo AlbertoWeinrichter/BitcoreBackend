@@ -1,0 +1,76 @@
+version: 2
+
+jobs:
+  # Commits to development branch
+  docker-build-development:
+    docker:
+      - image: circleci/node:10.15.0
+
+    working_directory: ~/repo
+
+    steps:
+      - checkout
+
+      - setup_remote_docker:
+          docker_layer_caching: true
+
+      - run: |
+          docker build -t aweinrichter/bitcore-backend-staging -f docker/Dockerfile.staging .
+          docker build -t aweinrichter/bitcore-socket-staging -f docker/Dockerfile.socketstaging .
+          docker login -u DOCKERHUB USERNAME -p DOCKERHUH PASSWORD
+          docker push aweinrichter/bitcore-backend-staging
+          docker push aweinrichter/bitcore-socket-staging
+
+      - run: |
+          ssh-keyscan bitcoregaming.com >> ~/.ssh/known_hosts
+
+      - run: |
+          ssh ubuntu@bitcoregaming.com sudo docker system prune -f
+          ssh ubuntu@bitcoregaming.com 'cd Bitcore && sudo -E docker-compose pull'
+          ssh ubuntu@bitcoregaming.com 'cd Bitcore && sudo -E docker-compose up -d bitcore-backend-staging'
+          ssh ubuntu@bitcoregaming.com 'cd Bitcore && sudo -E docker-compose up -d bitcore-socket-staging'
+
+  # Commits to master branch
+  docker-build-production:
+    docker:
+      - image: circleci/python:3.6.1
+
+    working_directory: ~/repo
+
+    steps:
+      - checkout
+
+      - setup_remote_docker:
+          docker_layer_caching: true
+
+      - run: |
+          docker build -t aweinrichter/bitcore-backend-production -f docker/Dockerfile.production .
+          docker build -t aweinrichter/bitcore-socket-production -f docker/Dockerfile.production .
+          docker login -u aweinrichter -p Cyberpunk2077
+          docker push aweinrichter/bitcore-backend-production
+          docker push aweinrichter/bitcore-socket-production
+
+      - run: |
+          ssh-keyscan bitcoregaming.com >> ~/.ssh/known_hosts
+
+      - run: |
+          ssh ubuntu@bitcoregaming.com sudo docker system prune -f
+          ssh ubuntu@bitcoregaming.com 'cd Bitcore && sudo -E docker-compose pull'
+          ssh ubuntu@bitcoregaming.com 'cd Bitcore && sudo -E docker-compose up -d bitcore-backend-production'
+          ssh ubuntu@bitcoregaming.com 'cd Bitcore && sudo -E docker-compose up -d bitcore-socket-production'
+
+workflows:
+  version: 2
+  build-deploy:
+    jobs:
+      - docker-build-development:
+          filters:
+            branches:
+              only:
+                - development
+
+      - docker-build-production:
+          filters:
+            branches:
+              only:
+                - master

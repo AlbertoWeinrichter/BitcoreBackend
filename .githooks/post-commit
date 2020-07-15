@@ -1,0 +1,248 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import contextlib
+import os
+import re
+import subprocess
+import tempfile
+import sys
+
+RED = "\033[1;31m"
+YELLOW = "\033[1;33m"
+BLUE = "\033[1;34m"
+CYAN = "\033[1;36m"
+GREEN = "\033[0;32m"
+RESET = "\033[0;0m"
+BOLD = "\033[;1m"
+REVERSE = "\033[;7m"
+
+
+_MARKER = "/tmp/post-commit-marker"
+
+
+@contextlib.contextmanager
+def prevent_nested_run():
+    """
+        Prevents commiting inside the hook re-triggering the hook
+    """
+    created = False
+    try:
+        if os.path.exists(_MARKER):
+            sys.exit(0)
+
+        with open(_MARKER, "w") as f:
+            f.write("\n")
+            created = True
+
+        yield
+    finally:
+        if created and os.path.exists(_MARKER):
+            os.remove(_MARKER)
+
+
+class NestedHookPrevent(object):
+    def __enter__(self):
+        if os.path.exists(_MARKER):
+            sys.exit(0)
+
+        with open(_MARKER, "w") as f:
+            f.write("\n")
+
+    def __exit__(self):
+        os.remove(_MARKER)
+
+
+def checkout_previous_revision(file):
+    """
+        Given a file path, this will create a file in a temp directory
+        of the previous revision.
+    """
+
+    command = "git cat-file -e HEAD^:%s" % file
+    try:
+        subprocess.check_output(command.split(" "), stderr=open(os.devnull, 'wb'))
+    except subprocess.CalledProcessError:
+        # File didn't exist in the previous revision
+        return ""
+
+    command = "git show HEAD^:%s" % file
+    command = command.split(" ")
+
+    try:
+        content = subprocess.check_output(command)
+        temp = tempfile.NamedTemporaryFile(delete=False)
+        temp.write(content)
+        return temp.name
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def changed_files(matching_pattern="^.*\.py$"):
+    """
+        Returns a list of files changed in the last commit
+    """
+    cmd = "git diff-tree --no-commit-id --name-only -r HEAD".split()
+    return [
+        x.strip()
+        for x in subprocess.check_output(cmd).split("\n")
+        if re.match(matching_pattern, x.strip())
+    ]
+
+
+def find_flake8_config():
+    this_dir = os.path.dirname(os.path.abspath(__file__))
+    while this_dir != "/":
+        possible_configs = [
+            os.path.join(this_dir, "tox.ini"),
+            os.path.join(this_dir, ".flake8"),
+            os.path.join(this_dir, "setup.cfg"),
+        ]
+        for config in possible_configs:
+            if os.path.exists(config):
+                return config
+
+        this_dir = os.path.dirname(this_dir)
+
+
+def run_flake8_on_changed_files(flake8_cmd):
+    def run_flake8(filename):
+        assert(os.path.exists(filename))
+
+        config = find_flake8_config()
+
+        try:
+            cmd = flake8_cmd.split() + ["--show-source"]
+            if config:
+                cmd.extend(["--config", config])
+            cmd.append(filename)
+
+            return subprocess.check_output(cmd)
+        except subprocess.CalledProcessError as e:
+            # return code is non-zero if there are issues
+            return e.output
+
+    def find_errors(output):
+        lines = output.split("\n")
+        lines = [x for x in lines if x.strip()]
+
+        result = []
+        # Because lines move around a lot, we need to parse the output
+        # to get the error number and the source that caused it so
+        # that we can compare without the line numbers
+        last_marker = None
+        for i, line in enumerate(lines):
+            if line.strip() != '^':
+                continue
+
+            # We hit a marker line so the error line is the
+            # one following the previous marker, the source
+            # is everything in between
+            error_line = last_marker + 1 if last_marker else 0
+            error = lines[error_line]
+            source = "\n".join(lines[error_line + 1:i])
+            marker = line
+            last_marker = i
+
+            assert(marker.strip() == '^') # This should always be a line marker
+
+            error_number = re.search("([E|W|F]\d{3})", error).group(0)
+            result.append(":".join([error_number, source]))
+        return result
+
+    files = changed_files()
+    if not files:
+        print(GREEN + "No Python files to check!" + RESET)
+        return
+
+    for filename in files:
+        previous = checkout_previous_revision(filename)
+        if previous:
+            previous_output = run_flake8(previous)
+            previous_output = previous_output.replace(previous, filename)
+            previous_errors = find_errors(previous_output)
+        else:
+            # File didn't exist
+            previous_errors = []
+
+        current_output = run_flake8(filename)
+        current_errors = find_errors(current_output)
+
+        additional = set(current_errors).difference(set(previous_errors))
+        fixed = set(previous_errors).difference(set(current_errors))
+
+        sys.stdout.write(BLUE + filename.ljust(64) + RESET)
+        if not current_errors:
+            sys.stdout.write(GREEN + u"✓" + RESET)
+            if fixed:
+                sys.stdout.write(u" (%s fixed!! Nice work! 🎉)\n" % len(fixed))
+            else:
+                sys.stdout.write("\n")
+
+        elif additional:
+            log_file = None
+            with tempfile.NamedTemporaryFile(delete=False) as log:
+                log.write(current_output)
+                log_file = log.name
+            sys.stdout.write(RED + u"❌" + RESET + " (%s errors introduced - see %s)\n" % (len(additional), log_file))
+
+        else:
+            log_file = None
+            with tempfile.NamedTemporaryFile(delete=False) as log:
+                log.write(current_output)
+                log_file = log.name
+            sys.stdout.write(YELLOW + u"⚠" + RESET + " (%s existing errors - see %s)\n" % (len(previous_errors), log_file))
+
+
+def run_isort():
+    try:
+        isort_path = subprocess.check_output(["which", "isort"]).strip()
+        root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        isort_found = root_dir in isort_path  # Make sure we don't pick up a system one
+    except subprocess.CalledProcessError:
+        isort_found = False
+
+    if not isort_found:
+        print("isort was not found in the virtualenv")
+        return
+
+    files = changed_files()
+    if not files:
+        print(GREEN + "No Python files to check!" + RESET)
+        return
+
+    def file_changed(filename):
+        return bool(subprocess.check_output(["git", "diff"]).strip())
+
+    files_changed = False
+    for filename in files:
+        assert(os.path.exists(isort_path))
+        assert(os.path.exists(filename))
+        subprocess.check_call([isort_path, filename])
+
+        if file_changed(filename):
+            files_changed = True
+            subprocess.check_call(["git", "add", filename])
+
+    if files_changed:
+        subprocess.check_output(["git", "commit", "--amend", "--no-verify", "--no-edit"])
+        print("isort changed some files. Commit has been amended.")
+    else:
+        print("isort was happy, nice one!")
+
+
+if __name__ == '__main__':
+    with prevent_nested_run():
+        try:
+            py3_path = subprocess.check_output(["which", "python3"]).rstrip()
+            print(BOLD + "Python 3 Compatibility" + RESET)
+            run_flake8_on_changed_files("%s -m flake8" % py3_path)
+        except subprocess.CalledProcessError as e:
+            print(e.output)
+            print("Install Python 3 globally for linting (e.g. pip3 install --user flake8")
+
+        print(BOLD + "flake8 Linting" + RESET)
+        run_flake8_on_changed_files('flake8')
+
+        print(BOLD + "isort Linting" + RESET)
+        run_isort()
